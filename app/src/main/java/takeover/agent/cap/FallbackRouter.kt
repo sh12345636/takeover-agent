@@ -70,12 +70,9 @@ object FallbackRouter {
         return Result(false, "none", 0, lastErr)
     }
 
-    /** uinput 通道：down→up 两条指令（完整手势 P2 由 Gateway 分帧） */
-    private fun tapViaUinput(x: Int, y: Int): Boolean {
-        val rp = takeover.agent.root.RootProvider
-        if (!rp.daemonAlive()) return false
-        return rp.send("d 0 $x $y") && rp.send("u 0")
-    }
+    /** uinput 通道：DaemonClient 单连接 down→up（P2 起 daemon 同时是 root 网关） */
+    private fun tapViaUinput(x: Int, y: Int): Boolean =
+        takeover.agent.root.DaemonClient.tap(x, y)
 
     /** 探测结果 → caps（Phase 0 结束时调用） */
     fun applyProfile(performClickOk: Boolean, uinputOk: Boolean, suOk: Boolean) {

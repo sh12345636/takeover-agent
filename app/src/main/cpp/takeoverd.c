@@ -1,22 +1,16 @@
 /*
- * takeoverd.c — 系统级多指注入 daemon（uinput 通道，后端 A/B 共用）
+ * takeoverd.c — 系统级多指注入 daemon + root 网关（P2）
  *
- * 设计要点：
- *  1. root 窗口内由 RootProvider 以 `setsid` 拉起，随后脱离 su 会话常驻；
- *  2. 启动时 open("/dev/uinput") 并 UI_DEV_CREATE —— 权限只在 open 时校验一次，
- *     之后临时 root 失效/会话撤销不影响写入（"root 是门票不是电源"）；
- *  3. Unix domain socket 收指令（文本协议，便于调试与跨语言接入）：
- *        i <w> <h>                 初始化：设置触摸屏尺寸
- *        d <slot> <x> <y>          按下（slot 0..9）
- *        m <slot> <x> <y>          移动
- *        u <slot>                  抬起
- *        q                          退出
- *     每条指令后立即 SYN_REPORT；组合手势由 Gateway 侧按序下发。
- *  4. 事件时间戳用 CLOCK_MONOTONIC（与 SystemClock.uptimeMillis 同源）——
- *     填错时钟域会被 Android InputReader 判为异常事件丢弃。
+ * 传输：TCP 127.0.0.1:17353（普通 app 可直连，零隐藏 API、零 su 依赖）
+ * 协议：行文本指令，每条回一行应答（O=ok / P=pong / X<len>\n<len字节>=执行结果）
+ *   i <w> <h>        设置触摸屏尺寸
+ *   d <slot> <x> <y> 按下    m <slot> <x> <y> 移动    u <slot> 抬起
+ *   p                探测（回 P）
+ *   x <shell cmd>    root 代执行（popen，输出尾行附加 __RC__<code>）→ X<len>\n<len字节>
+ *   q                断开
  *
- * 兼容性：设备名伪装成真实触摸屏（fts_ts），规避 uinput 设备名检测；
- *         无 ABS_MT_TRACKING_ID 支持的内核自动回退单点。
+ * 安全边界：仅监听 loopback；root 权限由"启动它的那一次 su"授予，
+ *           daemon 常驻后 app 不再需要 su（"root 是门票不是电源"）。
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,10 +19,12 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/un.h>
 #include <sys/ioctl.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <linux/uinput.h>
 #include <linux/input.h>
 #include <time.h>
@@ -36,37 +32,39 @@
 #define MAX_SLOT   10
 #define DEF_W      1080
 #define DEF_H      2400
-#define SOCK_PATH "/data/local/tmp/takeover/ud.sock"
+#define PORT       17353
+#define MAX_RESP   (64 * 1024)
 
 static int g_ufd = -1;
 static int g_w = DEF_W, g_h = DEF_H;
-static int g_tracking[MAX_SLOT];          /* slot -> tracking id, -1 空闲 */
+static int g_tracking[MAX_SLOT];
 static volatile sig_atomic_t g_run = 1;
+static pthread_mutex_t g_uinput_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void on_term(int sig) { (void)sig; g_run = 0; }
 
-/* CLOCK_MONOTONIC → struct timeval（uinput 事件时间戳） */
 static void mono_timeval(struct timeval *tv) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    tv->tv_sec  = ts.tv_sec;
+    tv->tv_sec = ts.tv_sec;
     tv->tv_usec = ts.tv_nsec / 1000;
 }
 
-static void emit(int type, int code, int val) {
+/* uinput 写入加锁：多连接并发时保持事件序列原子 */
+static int emit(int type, int code, int val) {
     struct input_event ev;
     memset(&ev, 0, sizeof(ev));
     mono_timeval(&ev.time);
-    ev.type  = (unsigned short)type;
-    ev.code  = (unsigned short)code;
+    ev.type = (unsigned short)type;
+    ev.code = (unsigned short)code;
     ev.value = val;
-    if (write(g_ufd, &ev, sizeof(ev)) != (ssize_t)sizeof(ev))
-        perror("uinput write");
+    pthread_mutex_lock(&g_uinput_lock);
+    ssize_t r = write(g_ufd, &ev, sizeof(ev));
+    pthread_mutex_unlock(&g_uinput_lock);
+    return r == (ssize_t)sizeof(ev) ? 0 : -1;
 }
-
 static void sync_report(void) { emit(EV_SYN, SYN_REPORT, 0); }
 
-/* 创建伪装触摸屏设备；返回 0 成功 */
 static int setup_uinput(void) {
     g_ufd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
     if (g_ufd < 0) { perror("open /dev/uinput"); return -1; }
@@ -82,15 +80,14 @@ static int setup_uinput(void) {
     struct uinput_setup usetup;
     memset(&usetup, 0, sizeof(usetup));
     usetup.id.bustype = BUS_USB;
-    usetup.id.vendor  = 0x048d;            /* 伪装成真实触控 IC 厂商 */
+    usetup.id.vendor  = 0x048d;
     usetup.id.product = 0x8870;
-    snprintf(usetup.name, UINPUT_MAX_NAME_SIZE, "fts_ts");  /* 设备名伪装 */
+    snprintf(usetup.name, UINPUT_MAX_NAME_SIZE, "fts_ts");
     if (ioctl(g_ufd, UI_DEV_SETUP, &usetup) < 0) { perror("UI_DEV_SETUP"); return -1; }
 
-    /* 触摸范围 = 屏幕尺寸（尺寸由 Gateway 经 i 指令下发，这里先设默认） */
     struct uinput_abs_setup abs;
     memset(&abs, 0, sizeof(abs));
-    abs.code = ABS_MT_POSITION_X; abs.absinfo.maximum = g_w - 1; abs.absinfo.fuzz = 0;
+    abs.code = ABS_MT_POSITION_X; abs.absinfo.maximum = g_w - 1;
     ioctl(g_ufd, UI_ABS_SETUP, &abs);
     abs.code = ABS_MT_POSITION_Y; abs.absinfo.maximum = g_h - 1;
     ioctl(g_ufd, UI_ABS_SETUP, &abs);
@@ -100,7 +97,7 @@ static int setup_uinput(void) {
     ioctl(g_ufd, UI_ABS_SETUP, &abs);
 
     if (ioctl(g_ufd, UI_DEV_CREATE) < 0) { perror("UI_DEV_CREATE"); return -1; }
-    usleep(100 * 1000);                    /* 等 InputReader 枚举完成 */
+    usleep(100 * 1000);
     for (int i = 0; i < MAX_SLOT; i++) g_tracking[i] = -1;
     return 0;
 }
@@ -118,7 +115,6 @@ static void do_down(int slot, int x, int y) {
     emit(EV_ABS, ABS_MT_POSITION_Y, y);
     sync_report();
 }
-
 static void do_move(int slot, int x, int y) {
     if (slot < 0 || slot >= MAX_SLOT || g_tracking[slot] == -1) return;
     emit(EV_ABS, ABS_MT_SLOT, slot);
@@ -126,12 +122,10 @@ static void do_move(int slot, int x, int y) {
     emit(EV_ABS, ABS_MT_POSITION_Y, y);
     sync_report();
 }
-
 static void do_up(int slot) {
     if (slot < 0 || slot >= MAX_SLOT || g_tracking[slot] == -1) return;
     emit(EV_ABS, ABS_MT_SLOT, slot);
-    emit(EV_ABS, ABS_MT_TRACKING_ID, -1);   /* -1 = 抬起该触点 */
-    /* 所有 slot 都空才松 BTN_TOUCH */
+    emit(EV_ABS, ABS_MT_TRACKING_ID, -1);
     int any = 0;
     for (int i = 0; i < MAX_SLOT; i++) if (g_tracking[i] != -1) any = 1;
     if (!any) emit(EV_KEY, BTN_TOUCH, 0);
@@ -139,37 +133,95 @@ static void do_up(int slot) {
     sync_report();
 }
 
-/* 指令循环：一行一条，空格分隔 */
-static void serve(int cfd) {
-    char buf[256];
+/* root 代执行：popen，末尾附加 __RC__<code> 供客户端解析 */
+static int exec_cmd(const char *cmd, char *out, size_t outsz, size_t *olen) {
+    char wrapped[8192];
+    snprintf(wrapped, sizeof(wrapped), "%s; echo __RC__$?", cmd);
+    FILE *fp = popen(wrapped, "r");
+    if (!fp) { *olen = 0; return -1; }
+    size_t total = 0;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), fp)) {
+        size_t n = strlen(buf);
+        if (total + n >= outsz - 1) break;
+        memcpy(out + total, buf, n);
+        total += n;
+    }
+    out[total] = '\0';
+    *olen = total;
+    int st = pclose(fp);
+    return WIFEXITED(st) ? 0 : -1;
+}
+
+static void handle_line(int cfd, char *line) {
+    /* 去尾部 \r */
+    size_t len = strlen(line);
+    while (len && (line[len-1] == '\r' || line[len-1] == '\n')) line[--len] = 0;
+    if (!len) return;
+
+    char cmd = line[0];
+    char resp[256];
+
+    if (cmd == 'q') { write(cfd, "O\n", 2); return; }
+
+    if (cmd == 'p') { write(cfd, "P\n", 2); return; }
+
+    if (cmd == 'i') {
+        int w = 0, h = 0;
+        sscanf(line + 1, "%d %d", &w, &h);
+        if (w > 0 && h > 0) { g_w = w; g_h = h; }
+        write(cfd, "O\n", 2); return;
+    }
+    if (cmd == 'd') {
+        int s, x, y; if (sscanf(line + 1, "%d %d %d", &s, &x, &y) == 3) do_down(s, x, y);
+        write(cfd, "O\n", 2); return;
+    }
+    if (cmd == 'm') {
+        int s, x, y; if (sscanf(line + 1, "%d %d %d", &s, &x, &y) == 3) do_move(s, x, y);
+        write(cfd, "O\n", 2); return;
+    }
+    if (cmd == 'u') {
+        int s; if (sscanf(line + 1, "%d", &s) == 1) do_up(s);
+        write(cfd, "O\n", 2); return;
+    }
+    if (cmd == 'x') {
+        const char *c = line + 1;
+        while (*c == ' ') c++;
+        if (!*c) { write(cfd, "E\n", 2); return; }
+        char *out = malloc(MAX_RESP);
+        if (!out) { write(cfd, "E\n", 2); return; }
+        size_t olen = 0;
+        exec_cmd(c, out, MAX_RESP, &olen);
+        int n = snprintf(resp, sizeof(resp), "X%zu\n", olen);
+        write(cfd, resp, n);
+        if (olen) write(cfd, out, olen);
+        free(out);
+        return;
+    }
+    write(cfd, "E\n", 2);
+}
+
+static void *serve_thread(void *arg) {
+    int cfd = (int)(intptr_t)arg;
+    char acc[4096];
+    size_t alen = 0;
     ssize_t n;
-    while (g_run && (n = read(cfd, buf, sizeof(buf) - 1)) > 0) {
-        buf[n] = '\0';
-        char *save = NULL;
-        char *cmd = strtok_r(buf, " \t\n", &save);
-        if (!cmd) continue;
-        if (strcmp(cmd, "i") == 0) {
-            char *a1 = strtok_r(NULL, " \t\n", &save);
-            char *a2 = strtok_r(NULL, " \t\n", &save);
-            if (a1 && a2) { g_w = atoi(a1); g_h = atoi(a2); }
-        } else if (strcmp(cmd, "d") == 0) {
-            char *s = strtok_r(NULL, " \t\n", &save);
-            char *x = strtok_r(NULL, " \t\n", &save);
-            char *y = strtok_r(NULL, " \t\n", &save);
-            if (s && x && y) do_down(atoi(s), atoi(x), atoi(y));
-        } else if (strcmp(cmd, "m") == 0) {
-            char *s = strtok_r(NULL, " \t\n", &save);
-            char *x = strtok_r(NULL, " \t\n", &save);
-            char *y = strtok_r(NULL, " \t\n", &save);
-            if (s && x && y) do_move(atoi(s), atoi(x), atoi(y));
-        } else if (strcmp(cmd, "u") == 0) {
-            char *s = strtok_r(NULL, " \t\n", &save);
-            if (s) do_up(atoi(s));
-        } else if (strcmp(cmd, "q") == 0) {
-            break;
+    while (g_run && (n = read(cfd, acc + alen, sizeof(acc) - 1 - alen)) > 0) {
+        alen += (size_t)n;
+        acc[alen] = '\0';
+        char *start = acc;
+        char *nl;
+        while ((nl = strchr(start, '\n')) != NULL) {
+            *nl = '\0';
+            handle_line(cfd, start);
+            start = nl + 1;
         }
+        alen = strlen(start);
+        if (alen) memmove(acc, start, alen);
+        if (alen >= sizeof(acc) - 1) alen = 0;   /* 防御：超长无换行丢弃 */
     }
     close(cfd);
+    return NULL;
 }
 
 int main(void) {
@@ -177,33 +229,39 @@ int main(void) {
     signal(SIGINT,  on_term);
     signal(SIGPIPE, SIG_IGN);
 
-    if (setup_uinput() != 0) return 1;      /* 失败 = capability uinput:false，走降级链 */
+    if (setup_uinput() != 0) return 1;
 
-    unlink(SOCK_PATH);
-    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
     if (lfd < 0) { perror("socket"); return 1; }
+    int one = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
-    struct sockaddr_un addr;
+    struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", SOCK_PATH);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   /* 仅 loopback */
     if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
-    chmod(SOCK_PATH, 0660);
-    if (listen(lfd, 4) < 0) { perror("listen"); return 1; }
+    if (listen(lfd, 8) < 0) { perror("listen"); return 1; }
 
-    fprintf(stderr, "takeoverd up: sock=%s screen=%dx%d\n", SOCK_PATH, g_w, g_h);
+    fprintf(stderr, "takeoverd up: tcp 127.0.0.1:%d screen=%dx%d\n", PORT, g_w, g_h);
 
     while (g_run) {
-        int cfd = accept(lfd, NULL, NULL);
+        struct sockaddr_in cli;
+        socklen_t cl = sizeof(cli);
+        int cfd = accept(lfd, (struct sockaddr *)&cli, &cl);
         if (cfd < 0) {
             if (errno == EINTR) continue;
-            perror("accept"); break;
+            if (!g_run) break;
+            perror("accept"); continue;
         }
-        serve(cfd);                          /* 单连接串行：保证多指时序不错乱 */
+        pthread_t th;
+        if (pthread_create(&th, NULL, serve_thread, (void *)(intptr_t)cfd) == 0)
+            pthread_detach(th);
+        else close(cfd);
     }
 
     ioctl(g_ufd, UI_DEV_DESTROY);
     close(g_ufd);
-    unlink(SOCK_PATH);
     return 0;
 }

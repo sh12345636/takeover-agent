@@ -47,6 +47,88 @@ object AppHooks {
 
         // 兼容性观测：目标 App 若自绘（树空），这里能第一时间从日志看出来
         XposedBridge.log("[Takeover] AppHooks installed @${lpparam.packageName}")
+
+        // P2：启动 L1 桥服务端（abstract socket tkov_<pkg>，Gateway 经 HookBridge 连入）
+        startBridgeServer(lpparam.packageName)
+    }
+
+    // ------------------------------------------------------ P2 桥服务端
+
+    /**
+     * 目标进程内命令服务：tree / tap / text / ping。
+     * 全程反射 android.local.*（hidden API，exemptHiddenApi 已豁免）；
+     * 起服务失败只记日志 —— Gateway 会自动降级 root 通道，不影响可用性。
+     */
+    private fun startBridgeServer(pkg: String) {
+        Thread {
+            try {
+                val ssCls = Class.forName("android.local.LocalServerSocket")
+                val ss = ssCls.getConstructor(String::class.java).newInstance("tkov_$pkg")
+                val accept = ssCls.getMethod("accept")
+                val sockCls = Class.forName("android.local.LocalSocket")
+                val getIs = sockCls.getMethod("getInputStream")
+                val getOs = sockCls.getMethod("getOutputStream")
+                val closeM = sockCls.getMethod("close")
+                XposedBridge.log("[Takeover] bridge server UP tkov_$pkg")
+                while (true) {
+                    val c = accept.invoke(ss)
+                    try {
+                        val ins = getIs.invoke(c) as java.io.InputStream
+                        val outs = getOs.invoke(c) as java.io.OutputStream
+                        handleBridge(ins, outs)
+                    } catch (t: Throwable) {
+                        XposedBridge.log("[Takeover] bridge handle: $t")
+                    }
+                    try { closeM.invoke(c) } catch (_: Throwable) { }
+                }
+            } catch (t: Throwable) {
+                XposedBridge.log("[Takeover] bridge server FAILED: $t")
+            }
+        }.apply { isDaemon = true; start() }
+    }
+
+    private fun handleBridge(inp: java.io.InputStream, out: java.io.OutputStream) {
+        val line = java.io.BufferedReader(java.io.InputStreamReader(inp)).readLine() ?: return
+        val resp = JSONObject()
+        try {
+            val req = JSONObject(line)
+            when (req.optString("op")) {
+                "ping" -> resp.put("ok", true)
+                "tree" -> {
+                    val nodes = onUiSync<String> { dumpUiTree() } ?: "[]"
+                    resp.put("ok", nodes.isNotEmpty()).put("nodes", nodes)
+                }
+                "tap" -> {
+                    val ok = onUiSync<Boolean> { performClick(req.optInt("vid")) } ?: false
+                    resp.put("ok", ok)
+                }
+                "text" -> {
+                    val ok = onUiSync<Boolean> { setText(req.optInt("vid"), req.optString("text")) } ?: false
+                    resp.put("ok", ok)
+                }
+                else -> resp.put("ok", false).put("err", "unknown op")
+            }
+        } catch (t: Throwable) {
+            resp.put("ok", false).put("err", t.message ?: "error")
+        }
+        try {
+            out.write((resp.toString() + "\n").toByteArray())
+            out.flush()
+        } catch (_: Throwable) { }
+    }
+
+    /** UI 线程同步执行（Hook 操作必须在主线程）；超时/异常返回 null */
+    private fun <T> onUiSync(timeoutMs: Long = 1500, block: () -> T): T? {
+        var result: T? = null
+        var done = false
+        val latch = java.util.concurrent.CountDownLatch(1)
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            try { result = block() } catch (_: Throwable) { }
+            done = true
+            latch.countDown()
+        }
+        latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        return if (done) result else null
     }
 
     /** hidden API 豁免：VMRuntime.setHiddenApiExemptions("") */

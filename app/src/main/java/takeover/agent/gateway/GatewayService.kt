@@ -4,21 +4,22 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import org.json.JSONObject
+import takeover.agent.root.DaemonClient
 import takeover.agent.root.RootProvider
 
 /**
- * Agent 接入层占位（P2 实装 MCP Server：UDS + localhost SSE + token）。
- *
- * P1 职责：
- *  1. 前台服务常驻（specialUse 类型，Android 14+ 合规）；
- *  2. 安装 daemon：从 jniLibs 拷 libtakeoverd.so → files/takeoverd（chmod 700）；
- *  3. Capability Probe → 锁后端 → 拉起 uinput daemon；
- *  4. **紧急停止入口**（见 docs 紧急停止指南）：本服务可被通知栏按钮/adb 广播停用。
+ * Agent 接入层（P2 实装）：
+ *  1. 前台服务常驻（specialUse）+ 紧急停止广播；
+ *  2. Capability Probe → 拉起/复用 daemon（app 零 su 依赖架构）；
+ *  3. **MCP HTTP Server**（127.0.0.1:17352，Bearer token 鉴权）；
+ *  4. hidden API 豁免（HookBridge 反射前置）。
  */
 class GatewayService : Service() {
 
@@ -26,10 +27,9 @@ class GatewayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        appContext = applicationContext
         startAsForeground()
-        Thread {
-            try { bootstrap() } catch (t: Throwable) { Log.e(TAG, "bootstrap failed", t) }
-        }.start()
+        Thread { try { bootstrap() } catch (t: Throwable) { Log.e(TAG, "bootstrap failed", t) } }.start()
     }
 
     private fun startAsForeground() {
@@ -42,8 +42,10 @@ class GatewayService : Service() {
         }
         val n = Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.ic_menu_compass)
-            .setContentTitle("TakeoverAgent 运行中")
-            .setContentText("系统级接管服务 · 点按可紧急停止（P2）")
+            .setContentTitle("TakeoverAgent · Gateway 运行中")
+            .setContentText("MCP 127.0.0.1:$PORT_MCP · token 尾号 ${token.takeLast(6)}")
+            .setStyle(Notification.BigTextStyle().bigText(
+                "MCP endpoint: http://127.0.0.1:$PORT_MCP/mcp\nBearer token: $token\n紧急停止：adb 广播或调用 emergency_stop 工具"))
             .build()
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -52,41 +54,49 @@ class GatewayService : Service() {
         }
     }
 
-    /** 引导：探测后端 → 装 daemon → 锁 capability */
+    /** 引导：豁免 → daemon → MCP server → 状态快照 */
     private fun bootstrap() {
-        val backend = RootProvider.probe()
-        Log.i(TAG, "backend=$backend su=${RootProvider.suVersion}")
+        HookBridge.exemptHiddenApi()
 
-        // daemon 二进制：jniLibs 打进 APK → nativeLibraryDir → su 拷到 /data/local/tmp 执行
-        // （不走 assets：mergeAssets 可能排在 cmake 之前，时机不可靠）
-        try {
-            val src = java.io.File(applicationInfo.nativeLibraryDir, "libtakeoverd.so")
-            val r = takeover.agent.root.RootProvider.exec(
-                "mkdir -p /data/local/tmp/takeover && " +
-                "cp '${src.absolutePath}' /data/local/tmp/takeover/takeoverd && " +
-                "chmod 700 /data/local/tmp/takeover/takeoverd", 5000
-            )
-            Log.i(TAG, "install daemon: ok=${r.ok} from=${src.exists()}")
-        } catch (t: Throwable) {
-            Log.e(TAG, "install daemon binary failed", t)
+        // daemon：已活着则复用（root 是门票不是电源）；否则尝试 su 一次性拉起
+        val dm = resources.displayMetrics
+        val daemonOk = RootProvider.ensureDaemon(dm.widthPixels, dm.heightPixels)
+        val backend = RootProvider.probe()
+        Log.i(TAG, "backend=$backend daemon=$daemonOk su=${RootProvider.suVersion}")
+
+        // 审计落盘
+        AuditLog.init(filesDir)
+
+        // capability 快照注入（get_state 可见）
+        FallbackRouterCaps.snapshot = {
+            JSONObject()
+                .put("performClick", backend == RootProvider.Backend.FULL_A)
+                .put("uinput", DaemonClient.alive())
+                .put("su_input", true)
+                .put("ui_tree_hook", false)     // 运行时按调用结果自然更新
+                .put("ui_tree_uia", daemonOk)
         }
 
-        // uinput 探测 + 拉起（root 窗口内完成，此后不依赖会话）
-        val dm = resources.displayMetrics
-        val uinputOk = RootProvider.ensureDaemon(dm.widthPixels, dm.heightPixels)
-        Log.i(TAG, "uinput daemon=$uinputOk sockAlive=${RootProvider.daemonAlive()}")
+        // 紧急停止回调
+        McpTools.onEmergencyStop = {
+            RootProvider.killDaemon()
+            val i = Intent(this, GatewayService::class.java).setAction(ACTION_EMERGENCY_STOP)
+            startService(i)
+        }
 
-        takeover.agent.cap.FallbackRouter.applyProfile(
-            performClickOk = backend == RootProvider.Backend.FULL_A,
-            uinputOk = uinputOk,
-            suOk = RootProvider.exec("id -u", 3000).let { it.ok && it.out.trim() == "0" }
-        )
+        // MCP HTTP server
+        val srv = McpHttpServer(PORT_MCP, token)
+        srv.onRequest = { _, raw -> McpTools.handleRpc(raw) }
+        val up = srv.start()
+        mcpServer = srv
+        Log.i(TAG, "MCP server up=$up on 127.0.0.1:$PORT_MCP token=${token.takeLast(6)}…")
     }
 
-    /** 紧急停止：adb 广播或通知栏触发 → 停服务 + 杀 daemon（模块仍可被 LSPosed 秒关） */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_EMERGENCY_STOP) {
-            RootProvider.exec("pkill -9 takeoverd", 3000)
+            Log.w(TAG, "EMERGENCY_STOP received")
+            try { mcpServer?.stop() } catch (_: Throwable) {}
+            RootProvider.killDaemon()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
@@ -94,9 +104,31 @@ class GatewayService : Service() {
         return START_STICKY
     }
 
+    override fun onDestroy() {
+        try { mcpServer?.stop() } catch (_: Throwable) {}
+        super.onDestroy()
+    }
+
+    /** token：持久随机（files/gateway_token），重启复用；Agent 侧配置用 */
+    private val token: String by lazy {
+        try {
+            val f = java.io.File(filesDir, "gateway_token")
+            if (f.exists() && f.readText().trim().length >= 16) f.readText().trim()
+            else java.util.UUID.randomUUID().toString().replace("-", "").also {
+                f.writeText(it); f.setReadableByNobodyWorks()
+            }
+        } catch (_: Throwable) { java.util.UUID.randomUUID().toString().replace("-", "") }
+    }
+
+    private fun java.io.File.setReadableByNobodyWorks() { /* 保持 app 私有（root 可读） */ }
+
     companion object {
         private const val TAG = "TakeoverGateway"
         private const val CHANNEL = "takeover_gateway"
+        const val PORT_MCP = 17352
         const val ACTION_EMERGENCY_STOP = "takeover.agent.EMERGENCY_STOP"
+
+        @Volatile var appContext: Context? = null
+        @Volatile private var mcpServer: McpHttpServer? = null
     }
 }
