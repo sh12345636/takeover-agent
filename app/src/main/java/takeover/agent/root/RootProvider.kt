@@ -47,11 +47,16 @@ object RootProvider {
         return backend
     }
 
-    /** root 执行：daemon 网关优先，su 兜底 */
+    /**
+     * root 执行：daemon 网关优先。
+     * daemon 存活时不回落 su —— 命令本身挂起时回落只是双倍等待；
+     * daemon 不在（alive=false）才走 su（此时 su 会触发一次性授权）。
+     */
     fun exec(cmd: String, timeoutMs: Long = 8000): ExecResult {
         if (DaemonClient.alive()) {
             val (rc, out) = DaemonClient.execRoot(cmd, timeoutMs.toInt())
-            if (rc >= 0) return ExecResult(rc, out, "")
+            return if (rc >= 0) ExecResult(rc, out, "")
+                   else ExecResult(-1, out, "daemon exec rc=$rc")
         }
         val (rc, out) = rawSu(cmd, timeoutMs)
         return ExecResult(rc, out, if (rc == 0) "" else "su failed rc=$rc")

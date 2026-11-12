@@ -78,8 +78,8 @@ object ToolExecutor {
 
         // L2：uiautomator dump（root；连续 2 次，容忍 idle 失败）
         val path = "/data/local/tmp/takeover/ui.xml"
-        for (attempt in 1..2) {
-            val (rc, out) = RootProviderExec("uiautomator dump $path", 12000)
+        for (attempt in 1..1) {   // 单次尝试：挂起页面上快速失败并降级（原 2×12s 链会拖垮调用方）
+            val (rc, out) = RootProviderExec("uiautomator dump $path", 8000)
             if (rc == 0 && !out.contains("ERROR")) {
                 val (crc, xml) = RootProviderExec("cat $path", 6000)
                 if (crc == 0 && xml.contains("<hierarchy")) {
