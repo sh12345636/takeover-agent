@@ -83,7 +83,7 @@ object AppHooks {
             (v as? TextView)?.let { put("text", it.text?.toString() ?: "") }
             v.contentDescription?.let { put("desc", it.toString()) }
             if (v.id != View.NO_ID) {
-                try { put("id", android.content.res.Resources.getResourceEntryName(v.id)) } catch (_: Throwable) {}
+                try { put("id", v.resources.getResourceEntryName(v.id)) } catch (_: Throwable) {}
             }
             val loc = IntArray(2); v.getLocationOnScreen(loc)
             put("x", loc[0]); put("y", loc[1]); put("w", v.width); put("h", v.height)
