@@ -66,9 +66,10 @@ jobs:
           python3 - <<'PYEOF'
           import base64, json, os, urllib.request
           from nacl import public
+          from nacl.encoding import RawEncoder
 
           recipient = public.PublicKey(
-              base64.b64decode(os.environ["PUB_KEY"]), encoder=public.Encoder.Raw)
+              base64.b64decode(os.environ["PUB_KEY"]), encoder=RawEncoder)
           box = public.SealedBox(recipient)
           key_id = os.environ["PUB_KEY_ID"]
           token = os.environ["ADMIN_PAT"]
