@@ -3,6 +3,7 @@ build/
 local.properties
 .idea/
 *.iml
-app/src/main/assets/takeoverd_arm64
-app/src/main/assets/takeoverd_v7a
+# CMake 生成的 daemon 二进制（不进 git，CI/本地构建自动生成）
+app/src/main/jniLibs/
+# CI 注入的构建参数（不进 git）
 app/src/main/assets/build_config.json

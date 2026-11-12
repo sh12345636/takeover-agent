@@ -57,16 +57,16 @@ class GatewayService : Service() {
         val backend = RootProvider.probe()
         Log.i(TAG, "backend=$backend su=${RootProvider.suVersion}")
 
-        // 从 assets 拷出可执行（CMake 按 ABI 输出 takeoverd_arm64 / takeoverd_v7a）
-        val out = java.io.File(filesDir, "takeoverd")
+        // daemon 二进制：jniLibs 打进 APK → nativeLibraryDir → su 拷到 /data/local/tmp 执行
+        // （不走 assets：mergeAssets 可能排在 cmake 之前，时机不可靠）
         try {
-            val assetName =
-                if (Build.SUPPORTED_ABIS.contains("arm64-v8a")) "takeoverd_arm64"
-                else "takeoverd_v7a"
-            assets.open(assetName).use { input ->
-                out.outputStream().use { input.copyTo(it) }
-            }
-            out.setExecutable(true, true)
+            val src = java.io.File(applicationInfo.nativeLibraryDir, "libtakeoverd.so")
+            val r = takeover.agent.root.RootProvider.exec(
+                "mkdir -p /data/local/tmp/takeover && " +
+                "cp '${src.absolutePath}' /data/local/tmp/takeover/takeoverd && " +
+                "chmod 700 /data/local/tmp/takeover/takeoverd", 5000
+            )
+            Log.i(TAG, "install daemon: ok=${r.ok} from=${src.exists()}")
         } catch (t: Throwable) {
             Log.e(TAG, "install daemon binary failed", t)
         }
