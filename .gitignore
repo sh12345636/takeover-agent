@@ -7,3 +7,7 @@ local.properties
 app/src/main/jniLibs/
 # CI 注入的构建参数（不进 git）
 app/src/main/assets/build_config.json
+# CI 还原的签名材料（绝不进 git）
+signing.properties
+*.p12
+*.jks

@@ -1,0 +1,99 @@
+# ============================================================
+# 一次性签名材料开通（Provision Signing）
+# 职责：runner 上 keytool 生成签名证书 → 加密写入仓库 Secrets
+# 安全：admin_pat 走 workflow input（私有仓库期间仅 owner 可见），
+#       完成后由维护者删除本次 run（连日志一并清除），再公开仓库。
+# ============================================================
+name: Provision Signing
+
+on:
+  workflow_dispatch:
+    inputs:
+      admin_pat:
+        description: "管理员 PAT（用于写入 Secrets；用后本 run 立即删除）"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    name: 生成签名证书并写入 Secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 配置 JDK（提供 keytool）
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 生成 PKCS12 证书 + 加密写入 Secrets
+        env:
+          ADMIN_PAT: ${{ inputs.admin_pat }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # ---- 1) 生成签名证书（RSA 2048，有效期 30 年）----
+          KS_PATH="$RUNNER_TEMP/release.p12"
+          STORE_PASS="$(openssl rand -hex 12 2>/dev/null || head -c 12 /dev/urandom | xxd -p -c 24)"
+          keytool -genkeypair \
+            -keystore "$KS_PATH" -storetype PKCS12 \
+            -storepass "$STORE_PASS" -keypass "$STORE_PASS" \
+            -alias takeover \
+            -keyalg RSA -keysize 2048 -validity 10950 \
+            -dname "CN=TakeoverAgent, OU=Agent, O=Takeover, C=CN"
+          KS_B64="$(base64 -w0 "$KS_PATH")"
+          echo "keystore generated: $(stat -c%s "$KS_PATH") bytes"
+
+          # ---- 2) 安装 sealed-box 加密库（runner 临时环境，允许 system site）----
+          pip3 install --quiet --disable-pip-version-check --break-system-packages pynacl \
+            || pip3 install --quiet --disable-pip-version-check --user pynacl
+
+          # ---- 3) 取仓库公钥，加密写入 4 个 Secrets ----
+          PUB_JSON="$(curl -sS -H "Authorization: Bearer $ADMIN_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/secrets/public-key")"
+          PKEY_ID="$(echo "$PUB_JSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["key_id"])')"
+          PKEY="$(echo "$PUB_JSON" | python3 -c 'import sys,json;print(json.load(sys.stdin)["key"])')"
+
+          KEYSTORE_P12_B64="$KS_B64" \
+          KEYSTORE_STORE_PASSWORD="$STORE_PASS" \
+          PUB_KEY_ID="$PKEY_ID" \
+          PUB_KEY="$PKEY" \
+          python3 - <<'PYEOF'
+          import base64, json, os, urllib.request
+          from nacl import public
+
+          recipient = public.PublicKey(
+              base64.b64decode(os.environ["PUB_KEY"]), encoder=public.Encoder.Raw)
+          box = public.SealedBox(recipient)
+          key_id = os.environ["PUB_KEY_ID"]
+          token = os.environ["ADMIN_PAT"]
+          repo = os.environ["REPO"]
+
+          def put(name: str, value: str) -> None:
+              enc = base64.b64encode(box.encrypt(value.encode())).decode()
+              req = urllib.request.Request(
+                  f"https://api.github.com/repos/{repo}/actions/secrets/{name}",
+                  data=json.dumps({"encrypted_value": enc, "key_id": key_id}).encode(),
+                  method="PUT",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github+json",
+                      "Content-Type": "application/json",
+                  })
+              with urllib.request.urlopen(req) as resp:
+                  print(f"secret {name} -> {resp.status}")
+
+          put("KEYSTORE_P12_BASE64", os.environ["KEYSTORE_P12_B64"])
+          put("KEYSTORE_STORE_PASSWORD", os.environ["KEYSTORE_STORE_PASSWORD"])
+          put("KEYSTORE_KEY_ALIAS", "takeover")
+          put("KEYSTORE_KEY_PASSWORD", os.environ["KEYSTORE_STORE_PASSWORD"])
+          PYEOF
+
+          echo "### ✅ 签名材料已写入 Secrets" >> "$GITHUB_STEP_SUMMARY"
+          echo "- KEYSTORE_P12_BASE64 / KEYSTORE_STORE_PASSWORD / KEYSTORE_KEY_ALIAS / KEYSTORE_KEY_PASSWORD" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **本 run 含敏感输入，请立即删除本 run 记录**" >> "$GITHUB_STEP_SUMMARY"

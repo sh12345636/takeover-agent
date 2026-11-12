@@ -99,6 +99,29 @@ jobs:
           EOF
           echo "build_config.json 已生成（api_key 是否注入: $([ -n "$API_KEY_VALUE" ] && echo YES || echo NO)）"
 
+      # ---- 还原签名材料（由 Provision Signing 写入的 Secrets，sealed-box 加密）----
+      - name: 还原签名材料
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_P12_BASE64 }}
+          STORE_PASS: ${{ secrets.KEYSTORE_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEYSTORE_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEYSTORE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KS_B64" ]; then
+            echo "SIGNED=no" >> "$GITHUB_ENV"
+            echo "::warning::未配置签名 Secrets，release 将产出 unsigned APK"
+            exit 0
+          fi
+          echo "$KS_B64" | base64 --decode > "$RUNNER_TEMP/release.p12"
+          cat > signing.properties <<EOF
+          storeFile=$RUNNER_TEMP/release.p12
+          storePassword=$STORE_PASS
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASS
+          EOF
+          echo "SIGNED=yes" >> "$GITHUB_ENV"
+          echo "签名材料已还原：$(stat -c%s "$RUNNER_TEMP/release.p12") bytes"
+
       - name: 构建 APK
         run: |
           chmod +x gradlew 2>/dev/null || true
@@ -112,13 +135,25 @@ jobs:
       - name: 校验并整理产物
         id: apk
         run: |
+          set -euo pipefail
           shopt -s nullglob
           DBG=(app/build/outputs/apk/debug/*.apk)
           REL=(app/build/outputs/apk/release/*.apk)
           echo "debug count=${#DBG[@]} release count=${#REL[@]}"
           mkdir -p dist
           [ ${#DBG[@]} -ge 1 ] && cp "${DBG[0]}" "dist/TakeoverAgent-debug.apk"
-          [ ${#REL[@]} -ge 1 ] && cp "${REL[0]}" "dist/TakeoverAgent-release-unsigned.apk"
+          if [ ${#REL[@]} -ge 1 ]; then
+            if [ "${SIGNED:-no}" = "yes" ]; then
+              cp "${REL[0]}" "dist/TakeoverAgent-release.apk"
+              APKSIGNER="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" \
+                -name apksigner -type f | sort -V | tail -n1)"
+              echo "== apksigner verify（release 签名校验）=="
+              "$APKSIGNER" verify --print-certs "dist/TakeoverAgent-release.apk" | sed -n '1,8p'
+            else
+              cp "${REL[0]}" "dist/TakeoverAgent-release-unsigned.apk"
+              echo "release: unsigned（无签名 Secrets）"
+            fi
+          fi
           ls -l dist/
           sha256sum dist/*.apk | tee dist/SHA256SUMS.txt
 
@@ -138,8 +173,9 @@ jobs:
         run: |
           set -euo pipefail
           TAG="build-$(date -u +%Y%m%d%H%M)-${GITHUB_SHA::7}"
+          NOTES="云端自动构建 · $( [ "${SIGNED:-no}" = yes ] && echo 'Release 已正式签名，可直接安装' || echo 'Release 未签名' ) · SHA256 见附件"
           gh release create "$TAG" dist/*.apk dist/SHA256SUMS.txt \
             --repo "$GITHUB_REPOSITORY" \
             --title "TakeoverAgent $TAG" \
-            --notes "云端自动构建 · 含 Debug(可安装) 与 Release(未签名) · SHA256 见附件"
+            --notes "$NOTES"
           echo "RELEASE_TAG=$TAG" >> "$GITHUB_STEP_SUMMARY"
