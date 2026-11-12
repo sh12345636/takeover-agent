@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Gateway 常驻：Android 14+ 强制 FGS 类型，specialUse 最稳（dataSync 有 6h 限制） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />   <!-- Android 13+ -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />   <!-- Android 11+ 包可见性 -->
+
+    <application
+        android:label="TakeoverAgent"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="false">
+
+        <!-- LSPosed 模块元数据（传统格式，兼容所有 LSPosed 版本） -->
+        <meta-data android:name="xposedmodule"      android:value="true" />
+        <meta-data android:name="xposeddescription" android:value="System-level agent takeover: semantic hooks + uinput injection" />
+        <meta-data android:name="xposedminversion"  android:value="93" />
+
+        <!-- P2 接入层占位：MCP Gateway（UDS + localhost SSE + token） -->
+        <service
+            android:name=".gateway.GatewayService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="local agent control gateway, localhost only" />
+        </service>
+    </application>
+</manifest>

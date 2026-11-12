@@ -1,0 +1,8 @@
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+app/src/main/assets/takeoverd_arm64
+app/src/main/assets/takeoverd_v7a
+app/src/main/assets/build_config.json
