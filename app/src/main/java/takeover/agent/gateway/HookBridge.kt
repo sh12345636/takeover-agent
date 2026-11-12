@@ -1,7 +1,5 @@
 package takeover.agent.gateway
 
-import android.os.Handler
-import android.os.Looper
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -29,7 +27,7 @@ object HookBridge {
                 .newInstance("tkov_$pkg", abstractNs)
 
             socketCls.getMethod("connect", addrCls).invoke(socket, addr)
-            socketCls.getMethod("setSoTimeout", Int::class.javaPrimitiveType).invoke(socket, timeoutMs)
+            socketCls.getMethod("setSoTimeout", Int::class.javaPrimitiveType!!).invoke(socket, timeoutMs)
 
             val os = socketCls.getMethod("getOutputStream").invoke(socket)
             val w = OutputStreamWriter(os.bufferedWriter())

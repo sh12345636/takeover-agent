@@ -3,6 +3,7 @@ package takeover.agent.root
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.io.BufferedWriter
 import java.net.InetSocketAddress
 import java.net.Socket
 
@@ -25,7 +26,7 @@ object DaemonClient {
             Socket().use { s ->
                 s.connect(InetSocketAddress(HOST, PORT), timeoutMs)
                 s.soTimeout = timeoutMs
-                val out = OutputStreamWriter(s.getOutputStream().bufferedWriter())
+                val out = BufferedWriter(OutputStreamWriter(s.getOutputStream()))
                 val inp = BufferedReader(InputStreamReader(s.getInputStream()))
                 for (l in lines) {
                     out.write(l); out.write("\n"); out.flush()
@@ -43,7 +44,7 @@ object DaemonClient {
             Socket().use { s ->
                 s.connect(InetSocketAddress(HOST, PORT), 800)
                 s.soTimeout = 800
-                val out = OutputStreamWriter(s.getOutputStream().bufferedWriter())
+                val out = BufferedWriter(OutputStreamWriter(s.getOutputStream()))
                 out.write("p\n"); out.flush()
                 BufferedReader(InputStreamReader(s.getInputStream())).readLine() == "P"
             }
@@ -59,7 +60,7 @@ object DaemonClient {
             Socket().use { s ->
                 s.connect(InetSocketAddress(HOST, PORT), 2000)
                 s.soTimeout = timeoutMs
-                val out = OutputStreamWriter(s.getOutputStream().bufferedWriter())
+                val out = BufferedWriter(OutputStreamWriter(s.getOutputStream()))
                 out.write("x $cmd"); out.write("\n"); out.flush()
                 val inp = BufferedReader(InputStreamReader(s.getInputStream()))
                 val head = inp.readLine() ?: return -1 to ""
@@ -100,7 +101,7 @@ object DaemonClient {
             Socket().use { s ->
                 s.connect(InetSocketAddress(HOST, PORT), 3000)
                 s.soTimeout = 3000
-                val out = OutputStreamWriter(s.getOutputStream().bufferedWriter())
+                val out = BufferedWriter(OutputStreamWriter(s.getOutputStream()))
                 val inp = BufferedReader(InputStreamReader(s.getInputStream()))
                 for (l in lines) {
                     out.write(l); out.write("\n"); out.flush()

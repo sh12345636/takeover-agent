@@ -58,6 +58,17 @@ class GatewayService : Service() {
     private fun bootstrap() {
         HookBridge.exemptHiddenApi()
 
+        // daemon 二进制落地：jniLibs 打进 APK → nativeLibraryDir → /data/local/tmp（root 拷贝）
+        try {
+            val src = java.io.File(applicationInfo.nativeLibraryDir, "libtakeoverd.so")
+            if (src.exists()) {
+                RootProvider.exec(
+                    "mkdir -p ${RootProvider.DAEMON_DIR} && " +
+                    "cp '${src.absolutePath}' ${RootProvider.DAEMON_BIN} && " +
+                    "chmod 700 ${RootProvider.DAEMON_BIN}", 6000)
+            }
+        } catch (t: Throwable) { Log.e(TAG, "stage daemon binary failed", t) }
+
         // daemon：已活着则复用（root 是门票不是电源）；否则尝试 su 一次性拉起
         val dm = resources.displayMetrics
         val daemonOk = RootProvider.ensureDaemon(dm.widthPixels, dm.heightPixels)

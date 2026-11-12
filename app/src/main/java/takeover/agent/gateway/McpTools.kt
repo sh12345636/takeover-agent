@@ -128,7 +128,7 @@ object McpTools {
         val result: JSONObject = try {
             when (method) {
                 "initialize" -> JSONObject()
-                    .put("protocolVersion", root.optJSONObject("params")?.optString("protocolVersion") ?: PROTOCOL_VERSION)
+                    .put("protocolVersion", (root.optJSONObject("params")?.optString("protocolVersion") ?: "").takeIf { it.isNotEmpty() } ?: PROTOCOL_VERSION)
                     .put("capabilities", JSONObject().put("tools", JSONObject()))
                     .put("serverInfo", JSONObject().put("name", SERVER_NAME).put("version", SERVER_VERSION))
                 "ping" -> JSONObject()
