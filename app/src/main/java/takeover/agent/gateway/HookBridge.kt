@@ -29,8 +29,8 @@ object HookBridge {
             socketCls.getMethod("connect", addrCls).invoke(socket, addr)
             socketCls.getMethod("setSoTimeout", Int::class.javaPrimitiveType!!).invoke(socket, timeoutMs)
 
-            val os = socketCls.getMethod("getOutputStream").invoke(socket)
-            val w = OutputStreamWriter(os.bufferedWriter())
+            val os = socketCls.getMethod("getOutputStream").invoke(socket) as java.io.OutputStream
+            val w = OutputStreamWriter(os)
             w.write(req.toString()); w.write("\n"); w.flush()
 
             val `is` = socketCls.getMethod("getInputStream").invoke(socket)
