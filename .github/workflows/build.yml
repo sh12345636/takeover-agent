@@ -59,17 +59,21 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      - name: 配置 Android SDK
-        uses: android-actions/setup-android@v3
-
+      # runner 预装完整 Android SDK（cmdline-tools 16.x）；
+      # 不用 android-actions/setup-android@v3 —— 它会装已被 Google 移除的 'tools' 包而失败
       - name: 安装 SDK 组件（platform / build-tools / NDK / CMake）
         run: |
-          sdkmanager --install \
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKM="$(find "$SDK/cmdline-tools" -name sdkmanager -type f | sort | tail -n1)"
+          echo "using sdkmanager: $SDKM"
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          "$SDKM" --install \
             "platforms;android-35" \
             "build-tools;35.0.0" \
             "ndk;27.0.12077973" \
             "cmake;3.22.1"
-          sdkmanager --list_installed | grep -E "platforms;android-35|ndk;27|cmake"
+          "$SDKM" --list_installed | grep -E "platforms;android-35|ndk;27|cmake" || true
 
       # ---- 注入构建参数（第 4 点）：生成 assets/build_config.json，随 APK 打包 ----
       # 敏感值优先取 Secrets：inputs.api_key_ref 指定 Secret 名，或默认 API_KEY
