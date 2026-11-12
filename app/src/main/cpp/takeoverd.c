@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/ioctl.h>
 #include <linux/uinput.h>
