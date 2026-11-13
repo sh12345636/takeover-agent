@@ -58,6 +58,11 @@ object HookBridge {
             runCatching { JSONObject(it).optBoolean("ok") }.getOrDefault(false)
         } == true
 
+    fun performLongClick(pkg: String, vid: Int): Boolean =
+        request(pkg, JSONObject().put("op", "long").put("vid", vid))?.let {
+            runCatching { JSONObject(it).optBoolean("ok") }.getOrDefault(false)
+        } == true
+
     fun setText(pkg: String, vid: Int, text: String): Boolean =
         request(pkg, JSONObject().put("op", "text").put("vid", vid).put("text", text))?.let {
             runCatching { JSONObject(it).optBoolean("ok") }.getOrDefault(false)

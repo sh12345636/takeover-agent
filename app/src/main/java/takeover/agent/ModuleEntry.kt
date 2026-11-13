@@ -28,7 +28,7 @@ class ModuleEntry : IXposedHookLoadPackage {
                 }
                 // 目标 App 作用域：白名单内才装 Hook
                 else -> {
-                    if (AppHooks.inWhitelist(lpparam.packageName)) {
+                    if (AppHooks.inWhitelist(lpparam)) {
                         XposedBridge.log("[Takeover] app scope: ${lpparam.packageName}")
                         AppHooks.install(lpparam)
                     }

@@ -20,16 +20,34 @@ import org.json.JSONObject
  */
 object AppHooks {
 
-    /** 骨架白名单（生产版改读 /data/local/tmp/takeover/whitelist.txt，root chmod 644 下发） */
-    private val TARGET_WHITELIST = setOf(
-        "com.tencent.mm",
-        "com.ss.android.ugc.aweme",
-        "com.android.settings"
-    )
-
     @Volatile private var currentActivity: Activity? = null
 
-    fun inWhitelist(pkg: String?): Boolean = pkg != null && pkg in TARGET_WHITELIST
+    /**
+     * 完全体接管策略：
+     *  - 默认：**第三方 App 全部接管**（系统进程不进，保系统稳定）；
+     *  - 覆盖文件 /data/local/tmp/takeover/hook_scope.txt（root 下发）：
+     *      每行一个包名 → 只接管列出的（白名单模式）
+     *      `!包名` 前缀 → 排除（黑名单模式，可与默认全通混用）
+     */
+    fun inWhitelist(lpparam: XC_LoadPackage.LoadPackageParam): Boolean {
+        val pkg = lpparam.packageName ?: return false
+        if (pkg == "android") return false
+        try {
+            val f = java.io.File("/data/local/tmp/takeover/hook_scope.txt")
+            if (f.canRead()) {
+                val lines = f.readText().lines().map { it.trim() }.filter { it.isNotEmpty() }
+                if (lines.isNotEmpty()) {
+                    val excludes = lines.filter { it.startsWith("!") }.map { it.removePrefix("!") }
+                    val includes = lines.filter { !it.startsWith("!") }
+                    if (pkg in excludes) return false
+                    if (includes.isNotEmpty()) return pkg in includes
+                }
+            }
+        } catch (_: Throwable) { }
+        val ai = lpparam.appInfo ?: return false
+        val isSystem = (ai.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+        return !isSystem
+    }
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         val cl = lpparam.classLoader
@@ -100,6 +118,10 @@ object AppHooks {
                 }
                 "tap" -> {
                     val ok = onUiSync<Boolean> { performClick(req.optInt("vid")) } ?: false
+                    resp.put("ok", ok)
+                }
+                "long" -> {
+                    val ok = onUiSync<Boolean> { performLongClick(req.optInt("vid")) } ?: false
                     resp.put("ok", ok)
                 }
                 "text" -> {
@@ -202,6 +224,15 @@ object AppHooks {
     }
 
     // ------------------------------------------------------------ 中文输入
+
+    /** L1 长按（语义）；不可长按返回 false → 调用方走 uinput hold */
+    fun performLongClick(vid: Int): Boolean {
+        val root = rootView() ?: return false
+        val target = findViewByVid(root, vid) ?: return false
+        return onUiSync(2000) {
+            try { target.isLongClickable && target.performLongClick() } catch (_: Throwable) { false }
+        } ?: false
+    }
 
     /** L1 文本写入：直接 setText，绕过软键盘与 ASCII 限制（中文友好） */
     fun setText(vid: Int, text: String): Boolean {

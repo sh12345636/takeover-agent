@@ -87,29 +87,65 @@ object DaemonClient {
     fun tap(x: Int, y: Int): Boolean =
         sendBatch(listOf("d 0 $x $y", "u 0"))
 
-    /** 分帧滑动：一条连接内连发（行缓冲保证不错乱），步间 usleep 级节奏由对端自然完成 */
-    fun swipe(x1: Int, y1: Int, x2: Int, y2: Int, steps: Int = 16, stepDelayMs: Int = 12): Boolean {
-        val lines = ArrayList<String>(steps + 2)
-        lines += "d 0 $x1 $y1"
-        for (i in 1..steps) {
-            val t = i.toFloat() / steps
-            lines += "m 0 ${x1 + ((x2 - x1) * t).toInt()} ${y1 + ((y2 - y1) * t).toInt()}"
+    /** 长按：同一连接 down → 保持 → up（uinput hold 通道） */
+    fun hold(x: Int, y: Int, ms: Int): Boolean = try {
+        Socket().use { s ->
+            s.connect(InetSocketAddress(HOST, PORT), 3000)
+            s.soTimeout = ms + 3000
+            val out = BufferedWriter(OutputStreamWriter(s.getOutputStream()))
+            val inp = BufferedReader(InputStreamReader(s.getInputStream()))
+            fun send(l: String): Boolean {
+                out.write(l); out.write("\n"); out.flush()
+                return inp.readLine() == "O"
+            }
+            if (!send("d 0 $x $y")) return false
+            Thread.sleep(ms.toLong().coerceIn(50, 5000))
+            send("u 0")
         }
-        lines += "u 0"
-        // 逐条发送并在客户端控制节奏（TCP 小包 + 对端即发即生效）
+    } catch (_: Throwable) { false }
+
+    /**
+     * 分帧滑动（完全体：默认拟人化）
+     *  human=true  → 二次贝塞尔弧线 + 缓入缓出变速 + ±2px 抖动（防机械轨迹风控）
+     *  human=false → 直线匀速
+     */
+    fun swipe(x1: Int, y1: Int, x2: Int, y2: Int, steps: Int = 16, human: Boolean = true): Boolean {
+        val rnd = java.util.Random()
+        val dx = (x2 - x1).toDouble(); val dy = (y2 - y1).toDouble()
+        val len = Math.hypot(dx, dy).coerceAtLeast(1.0)
+        val nx = -dy / len; val ny = dx / len
+        val bend = (rnd.nextDouble() * 0.3 - 0.15) * len
+        val cx = (x1 + x2) / 2.0 + nx * bend
+        val cy = (y1 + y2) / 2.0 + ny * bend
+        val pts = ArrayList<Pair<Int, Int>>(steps)
+        for (i in 1..steps) {
+            val t = i.toDouble() / steps
+            val mt = 1 - t
+            var px = mt * mt * x1 + 2 * mt * t * cx + t * t * x2
+            var py = mt * mt * y1 + 2 * mt * t * cy + t * t * y2
+            if (human) { px += rnd.nextInt(5) - 2; py += rnd.nextInt(5) - 2 }
+            pts += px.toInt().coerceIn(0, 32767) to py.toInt().coerceIn(0, 32767)
+        }
         return try {
             Socket().use { s ->
                 s.connect(InetSocketAddress(HOST, PORT), 3000)
                 s.soTimeout = 3000
                 val out = BufferedWriter(OutputStreamWriter(s.getOutputStream()))
                 val inp = BufferedReader(InputStreamReader(s.getInputStream()))
-                for (l in lines) {
+                fun send(l: String): Boolean {
                     out.write(l); out.write("\n"); out.flush()
-                    val ack = inp.readLine() ?: return false
-                    if (ack != "O") return false
-                    if (l.startsWith("m 0")) Thread.sleep(stepDelayMs.toLong())
+                    return inp.readLine() == "O"
                 }
-                true
+                if (!send("d 0 $x1 $y1")) return false
+                for ((i, pt) in pts.withIndex()) {
+                    if (!send("m 0 ${pt.first} ${pt.second}")) return false
+                    if (human) {
+                        val t = (i + 1).toDouble() / steps
+                        val speed = Math.sin(Math.PI * t).coerceAtLeast(0.15)
+                        Thread.sleep((14.0 / speed).toLong().coerceIn(6, 60))
+                    } else Thread.sleep(12)
+                }
+                send("u 0")
             }
         } catch (_: Throwable) { false }
     }

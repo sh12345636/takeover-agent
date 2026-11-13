@@ -95,6 +95,14 @@ class GatewayService : Service() {
             startService(i)
         }
 
+        // LSPosed 作用域全自动配置（首启执行；写完需重启一次才被 LSPosed 加载）
+        try {
+            val cfg = LsposedAutoConfig.run()
+            Log.i(TAG, "lsposed-auto-config: ${cfg.detail} rebootNeeded=${cfg.rebootNeeded}")
+            AuditLog.log("lsposed_auto_config", cfg.detail, "root", 0, !cfg.detail.startsWith("failed"),
+                if (cfg.rebootNeeded) "REBOOT_REQUIRED" else null)
+        } catch (t: Throwable) { Log.e(TAG, "lsposed auto config error", t) }
+
         // MCP HTTP server
         val srv = McpHttpServer(PORT_MCP, token)
         srv.onRequest = { _, raw -> McpTools.handleRpc(raw) }

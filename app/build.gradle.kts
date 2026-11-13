@@ -30,8 +30,8 @@ android {
         applicationId = "takeover.agent"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0-p1"
+        versionCode = 2
+        versionName = "1.0.0"
 
         // 双 ABI：arm64 主线 + v7a 兼容老机
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }

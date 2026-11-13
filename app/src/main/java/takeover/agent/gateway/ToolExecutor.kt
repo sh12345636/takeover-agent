@@ -241,7 +241,7 @@ object ToolExecutor {
         if (x1 == 0 && y1 == 0 && x2 == 0 && y2 == 0)
             return Result(false, "none", err = "需要 x1/y1/x2/y2")
 
-        if (DaemonClient.swipe(x1, y1, x2, y2, steps))
+        if (DaemonClient.swipe(x1, y1, x2, y2, steps, human = args.optBoolean("human", true)))
             return Result(true, "uinput")
         val (rc, _) = RootProviderExec("input swipe $x1 $y1 $x2 $y2 $dur", 8000)
         return if (rc == 0) Result(true, "su_input") else Result(false, "none", err = "swipe 全链失败")
@@ -317,6 +317,96 @@ object ToolExecutor {
         else Result(false, "none", err = "启动失败: $pkg")
     }
 
+    // --------------------------------------------------------------- key
+
+    fun key(args: JSONObject): Result {
+        val k = args.optString("key", "")
+        val code = when (k.lowercase()) {
+            "back" -> 4; "home" -> 3; "recents", "app_switch" -> 187
+            "enter" -> 66; "delete", "del" -> 67; "tab" -> 61
+            "volume_up" -> 24; "volume_down" -> 25; "power" -> 26
+            else -> k.toIntOrNull() ?: return Result(false, "none", err = "unknown key: $k")
+        }
+        val (rc, _) = RootProviderExec("input keyevent $code", 4000)
+        return if (rc == 0) Result(true, "su_input", JSONObject().put("code", code))
+               else Result(false, "none", err = "keyevent failed")
+    }
+
+    // --------------------------------------------------------- long_click
+
+    fun longClick(args: JSONObject): Result {
+        val pkg = frontPackage()
+        val sel = args.optString("selector").takeIf { it.isNotEmpty() }
+        var vid = args.optInt("vid", 0)
+        var x = args.optInt("x", Int.MIN_VALUE)
+        var y = args.optInt("y", Int.MIN_VALUE)
+        val holdMs = args.optInt("hold_ms", 600).coerceIn(100, 5000)
+
+        if (sel != null) {
+            val tree = freshTree() ?: return Result(false, "none", err = "树不可用，改用 x/y")
+            val node = matchSelector(sel, tree) ?: return Result(false, "none", err = "selector 未命中: $sel")
+            vid = node.vid; x = node.cx; y = node.cy
+        }
+        if (x == Int.MIN_VALUE || y == Int.MIN_VALUE) return Result(false, "none", err = "需要 selector 或 x/y")
+
+        if (vid != 0 && pkg.isNotEmpty() && HookBridge.performLongClick(pkg, vid))
+            return Result(true, "performLongClick")
+        if (DaemonClient.hold(x, y, holdMs)) return Result(true, "uinput_hold")
+        val (rc, _) = RootProviderExec("input swipe $x $y $x $y $holdMs", 6000)
+        return if (rc == 0) Result(true, "su_hold") else Result(false, "none", err = "long_click 全链失败")
+    }
+
+    // --------------------------------------------------------------- wait
+
+    fun waitMs(args: JSONObject): Result {
+        val ms = args.optInt("ms", 500).coerceIn(0, 10000)
+        Thread.sleep(ms.toLong())
+        return Result(true, "local")
+    }
+
+    // -------------------------------------------------------------- shell
+
+    fun shell(args: JSONObject): Result {
+        val cmd = args.optString("cmd")
+        if (cmd.isEmpty()) return Result(false, "none", err = "需要 cmd")
+        val timeout = args.optInt("timeout_ms", 10000).coerceIn(1000, 60000)
+        val r = RootProvider.exec(cmd, timeout.toLong())
+        val payload = JSONObject().put("rc", r.code).put("stdout", r.out.take(65536))
+        return Result(r.ok, "root", payload, if (r.ok) null else "rc=${r.code}")
+    }
+
+    // -------------------------------------------------------------- combo
+
+    /** 代打/多步编排：顺序执行手势序列（单步可带 delay_ms / stop_on_fail） */
+    fun combo(args: JSONObject): Result {
+        val steps = args.optJSONArray("steps") ?: return Result(false, "none", err = "需要 steps[]")
+        val results = org.json.JSONArray()
+        val t0 = System.currentTimeMillis()
+        var allOk = true
+        for (i in 0 until steps.length()) {
+            val st = steps.optJSONObject(i) ?: continue
+            val op = st.optString("op")
+            val ts = System.currentTimeMillis()
+            val r = try {
+                when (op) {
+                    "tap" -> tap(st); "swipe" -> swipe(st); "key" -> key(st)
+                    "long" -> longClick(st); "wait" -> waitMs(st)
+                    "type" -> typeText(st); "launch" -> launchApp(st)
+                    else -> Result(false, "none", err = "unknown op: $op")
+                }
+            } catch (t: Throwable) { Result(false, "none", err = t.message ?: "err") }
+            if (!r.ok) allOk = false
+            results.put(JSONObject().put("i", i).put("op", op).put("ok", r.ok)
+                .put("ch", r.channel).put("ms", System.currentTimeMillis() - ts)
+                .also { if (r.err != null) it.put("err", r.err) })
+            val delay = st.optInt("delay_ms", 0)
+            if (delay > 0) Thread.sleep(delay.toLong().coerceAtMost(3000))
+            if (!r.ok && st.optBoolean("stop_on_fail", true)) break
+        }
+        return Result(allOk, "combo",
+            JSONObject().put("steps", results).put("total_ms", System.currentTimeMillis() - t0))
+    }
+
     // ------------------------------------------------------------- get_state
 
     fun getState(): JSONObject {
@@ -330,6 +420,8 @@ object ToolExecutor {
             .put("rotation", rotation())
             .put("sdk", Build.VERSION.SDK_INT)
             .put("capabilities", caps)
+            .put("lock", AgentLock.snapshot())
+            .put("lsposed_auto_configured", LsposedAutoConfig.alreadyConfigured())
             .put("audit", AuditLog.stats())
             .put("audit_tail", org.json.JSONArray().also { arr ->
                 for (e in AuditLog.tail(8)) arr.put(JSONObject()

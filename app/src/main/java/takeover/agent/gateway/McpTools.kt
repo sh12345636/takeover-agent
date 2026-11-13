@@ -68,14 +68,63 @@ object McpTools {
         tools += tool("emergency_stop", "紧急停止：杀注入 daemon 并停掉 Gateway（后悔机制 L1）",
             JSONObject())
 
+        tools += tool("key", "按键：back/home/recents/enter 或数字 keycode（root input keyevent）",
+            JSONObject().put("key", str("back|home|recents|enter|delete|volume_up|power 或数字")))
+
+        tools += tool("long_click", "长按（selector/vid 走语义通道，坐标走 uinput hold）",
+            JSONObject()
+                .put("selector", str("选择器"))
+                .put("x", int("x")).put("y", int("y"))
+                .put("vid", int("句柄"))
+                .put("hold_ms", int("保持毫秒，默认 600")))
+
+        tools += tool("wait", "等待 N 毫秒（上限 10s）",
+            JSONObject().put("ms", int("毫秒，默认 500")))
+
+        tools += tool("shell", "root 执行 shell 命令并返回 stdout（系统级万能工具）",
+            JSONObject()
+                .put("cmd", str("shell 命令"))
+                .put("timeout_ms", int("超时，默认 10000，上限 60000")))
+
+        tools += tool("combo", "多步编排（代打核心）：顺序执行 tap/swipe/key/long/wait/type/launch 序列",
+            JSONObject()
+                .put("steps", JSONObject().put("type", "array").put("description",
+                    "[{op:tap|swipe|key|long|wait|type|launch, ..., delay_ms?, stop_on_fail?}]"))
+                .put("agent", str("可选：Agent id（受互斥锁约束）")))
+
+        tools += tool("acquire_lock", "获取操作互斥锁（同一时刻一个 Agent 掌控设备）",
+            JSONObject()
+                .put("agent", str("你的 Agent id"))
+                .put("ttl_sec", int("持有秒数，默认 600，到期自动释放")))
+
+        tools += tool("release_lock", "释放互斥锁",
+            JSONObject().put("agent", str("你的 Agent id")))
+
         return JSONObject().put("tools", tools)
     }
 
     // ---------------------------------------------------------- tools/call
 
     /** 返回 MCP tools/call 的 result（或抛给上层做 error） */
+    /** 操作类工具（受锁保护）与免锁工具 */
+    private val LOCKED_TOOLS = setOf(
+        "tap", "swipe", "type_text", "launch_app", "key", "long_click", "wait", "shell", "combo"
+    )
+
     fun call(name: String, args: JSONObject): JSONObject {
         val t0 = System.currentTimeMillis()
+
+        // ---- 多 Agent 互斥锁 ----
+        val agent = args.optString("agent").ifEmpty { "default" }
+        if (name in LOCKED_TOOLS && !AgentLock.check(agent)) {
+            val msg = "locked by ${AgentLock.holder} —— 先 acquire_lock 或等待其 TTL 过期"
+            AuditLog.log(name, args.toString(), "lock", 0, false, msg)
+            val payload = JSONObject().put("ok", false).put("channel", "lock").put("error", msg)
+            return JSONObject()
+                .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", payload.toString())))
+                .put("isError", true)
+        }
+
         val r: ToolExecutor.Result = try {
             when (name) {
                 "get_state" -> ToolExecutor.Result(true, "local", ToolExecutor.getState())
@@ -87,6 +136,19 @@ object McpTools {
                 "emergency_stop" -> {
                     onEmergencyStop()
                     ToolExecutor.Result(true, "local", JSONObject().put("stopped", true))
+                }
+                "key" -> ToolExecutor.key(args)
+                "long_click" -> ToolExecutor.longClick(args)
+                "wait" -> ToolExecutor.waitMs(args)
+                "shell" -> ToolExecutor.shell(args)
+                "combo" -> ToolExecutor.combo(args)
+                "acquire_lock" -> {
+                    val (ok, msg) = AgentLock.acquire(agent, args.optInt("ttl_sec", 600))
+                    ToolExecutor.Result(ok, "lock", JSONObject().put("msg", msg).put("lock", AgentLock.snapshot()))
+                }
+                "release_lock" -> {
+                    val ok = AgentLock.release(agent)
+                    ToolExecutor.Result(ok, "lock", JSONObject().put("released", ok).put("lock", AgentLock.snapshot()))
                 }
                 else -> ToolExecutor.Result(false, "none", err = "未知工具: $name")
             }
