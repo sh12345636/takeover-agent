@@ -3,6 +3,7 @@ package takeover.agent.gateway
 import android.database.sqlite.SQLiteDatabase
 import android.os.Process
 import org.json.JSONObject
+import takeover.agent.root.RootProvider
 import java.io.File
 
 /**
@@ -47,7 +48,7 @@ object LsposedAutoConfig {
             // 2) 杀 lspd + 拷出三件套（root）
             val uid = Process.myUid()
             RootProvider.exec(
-                "pidof lspd | tr ' ' '\\n' | while read p; do kill -9 $p 2>/dev/null; done; " +
+                "pidof lspd | tr ' ' '\\n' | while read p; do kill -9 \$p 2>/dev/null; done; " +
                 "sleep 0.4; cp $LSPD_DIR/$DB $LSPD_DIR/$DB-wal $LSPD_DIR/$DB-shm ${files.absolutePath}/ 2>/dev/null; " +
                 "chown $uid:$uid ${files.absolutePath}/$DB*", 10000
             )
@@ -63,7 +64,7 @@ object LsposedAutoConfig {
 
             // 4) 拷回（再杀一次防 lspd 复活写入）+ 还原权限
             RootProvider.exec(
-                "pidof lspd | tr ' ' '\\n' | while read p; do kill -9 $p 2>/dev/null; done; " +
+                "pidof lspd | tr ' ' '\\n' | while read p; do kill -9 \$p 2>/dev/null; done; " +
                 "cp ${files.absolutePath}/$DB ${files.absolutePath}/$DB-wal ${files.absolutePath}/$DB-shm $LSPD_DIR/ && " +
                 "chown root:root $LSPD_DIR/$DB $LSPD_DIR/$DB-wal $LSPD_DIR/$DB-shm && " +
                 "chmod 600 $LSPD_DIR/$DB $LSPD_DIR/$DB-wal $LSPD_DIR/$DB-shm", 10000
@@ -89,12 +90,9 @@ object LsposedAutoConfig {
     }
 
     private fun collectThirdPartyPkgs(): List<String> {
-        val (rc, out) = run {
-            val r = RootProvider.exec("pm list packages -3", 8000)
-            r.code to r.out
-        }
-        if (rc != 0) return emptyList()
-        return out.lines()
+        val r = RootProvider.exec("pm list packages -3", 8000)
+        if (r.code != 0) return emptyList()
+        return r.out.lines()
             .map { it.trim() }
             .filter { it.startsWith("package:") }
             .map { it.removePrefix("package:") }
